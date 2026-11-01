@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🏝️ Minha Ilha</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#87c7ea;font-family:system-ui,sans-serif;user-select:none}
+  #hud{position:fixed;left:12px;top:10px;color:#fff;text-shadow:0 1px 3px #0008;font-weight:700}
+  #hud small{font-weight:500;opacity:.9}
+  #bar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;gap:8px;align-items:center;
+       background:#0006;padding:8px 10px;border-radius:14px;color:#fff;font-weight:700}
+  #bar button{border:0;border-radius:10px;padding:8px 14px;font:inherit;cursor:pointer;background:#ffffffcc;color:#333}
+  #bar button.on{background:#ffd34d;color:#3a2a00}
+  #toast{position:fixed;left:50%;top:18%;transform:translateX(-50%);color:#fff;font-weight:800;font-size:20px;
+         text-shadow:0 2px 4px #000a;opacity:0;transition:opacity .3s;pointer-events:none}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="hud">🏝️ Minha Ilha<br><small>clique no chão para andar · clique numa palmeira para colher coco · arraste para mover o mapa · botão direito gira · 📍/C centraliza · 1/2 trocam o modo</small></div>
+<div id="bar">
+  <button id="mWalk" class="on">🚶 Andar</button>
+  <button id="mPlant">🌴 Plantar</button>
+  <button id="mCenter" title="Centralizar no personagem (C)">📍</button>
+  <span style="margin-left:8px">🥥 <span id="coco">0</span></span>
+</div>
+<div id="toast"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------- básico ----------
+// qualidade: alta por padrão; use ?q=low para máquinas fracas
+const HQ = !location.search.includes('q=low');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(HQ ? Math.min(devicePixelRatio, 3) : 1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#8fd0f0');
+scene.fog = new THREE.Fog('#8fd0f0', 140, 420);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(26, 32, 32);
+
+// câmera: só gira na horizontal (ângulo vertical travado), sem pan
+const controls = new OrbitControls(camera, renderer.domElement);
+const POLAR = 0.95;
+controls.minPolarAngle = controls.maxPolarAngle = POLAR;
+// arrastar (esquerdo / 1 dedo) move o mapa no plano do chão; direito / 2 dedos gira
+controls.enablePan = true;
+controls.screenSpacePanning = false;
+controls.panSpeed = 1.2;
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+controls.enableDamping = true;
+controls.minDistance = 14;
+controls.maxDistance = 150;
+controls.target.set(0, 0, 0);
+
+// ---------- luz ----------
+scene.add(new THREE.HemisphereLight('#cfeaff', '#e0c58f', 0.9));
+const sun = new THREE.DirectionalLight('#fff3d6', 2.2);
+sun.position.set(60, 90, 30);
+sun.castShadow = true;
+sun.shadow.mapSize.set(HQ ? 8192 : 2048, HQ ? 8192 : 2048);
+sun.shadow.radius = 3;
+Object.assign(sun.shadow.camera, { left: -80, right: 80, top: 80, bottom: -80, far: 300 });
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+// ---------- ruído ----------
+function hash(x, y) { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); }
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y) { let t = 0, a = 0.5, f = 1; for (let i = 0; i < 4; i++) { t += a * noise(x * f, y * f); a *= 0.5; f *= 2; } return t; }
+
+// ---------- ilha (mais plana) ----------
+const R = 44; // área ~6x a anterior (R=18)
+function heightAt(x, z) {
+  const ang = Math.atan2(z, x);
+  // contorno irregular: ruído + lóbulos (penínsulas e baías)
+  const rr = R * (0.72 + 0.55 * fbm(x * 0.022 + 11, z * 0.022 - 7)
+           + 0.13 * Math.sin(3 * ang + 1.3) + 0.08 * Math.sin(5 * ang - 0.4));
+  const d = Math.hypot(x, z) / rr;
+  const shape = 1 - d * d;
+  const h = shape * 2.5 + (fbm(x * 0.08 + 5, z * 0.08) - 0.5) * 1.4 * Math.max(shape, 0);
+  const hill = Math.exp(-((x + 10) ** 2 + (z + 8) ** 2) / 200) * 1.8;
+  return Math.max(h + hill, -6) - 0.6;
+}
+const islandGeo = new THREE.PlaneGeometry(240, 240, HQ ? 480 : 240, HQ ? 480 : 240);
+islandGeo.rotateX(-Math.PI / 2);
+const pos = islandGeo.attributes.position;
+const colors = [];
+const cSand = new THREE.Color('#f2d9a0'), cWet = new THREE.Color('#c9b07a'),
+      cGrass = new THREE.Color('#6dbb4b'), cDark = new THREE.Color('#3f8a3a');
+for (let i = 0; i < pos.count; i++) {
+  const x = pos.getX(i), z = pos.getZ(i), y = heightAt(x, z);
+  pos.setY(i, y);
+  let c;
+  if (y < -0.4) c = new THREE.Color('#1b7fc7').lerp(cWet, Math.max(0, (y + 6.6) / 6.2) ** 2);
+  else if (y < -0.1) c = cWet;
+  else if (y < 0.15) c = new THREE.Color('#f4f8f2');
+  else if (y < 0.8) c = cSand;
+  else c = cGrass.clone().lerp(cDark, Math.min(1, (y - 0.8) / 2) * fbm(x * .3, z * .3) * 1.4);
+  colors.push(c.r, c.g, c.b);
+}
+islandGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+{ // recorta em círculo
+  const idx = islandGeo.index.array, keep = [];
+  const rr = (i) => Math.hypot(pos.getX(i), pos.getZ(i));
+  for (let i = 0; i < idx.length; i += 3)
+    if (Math.min(rr(idx[i]), rr(idx[i+1]), rr(idx[i+2])) < 118) keep.push(idx[i], idx[i+1], idx[i+2]);
+  islandGeo.setIndex(keep);
+}
+islandGeo.computeVertexNormals();
+const island = new THREE.Mesh(islandGeo, new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.95 }));
+island.receiveShadow = true;
+scene.add(island);
+
+// ---------- oceano (ondas na GPU) ----------
+// textura de profundidade (para as faixas de azul seguirem a costa irregular)
+const DS = 240, DN = HQ ? 1024 : 256, depthData = new Uint8Array(DN * DN);
+for (let j = 0; j < DN; j++) for (let i = 0; i < DN; i++) {
+  const x = (i / (DN - 1) - 0.5) * DS, z = (j / (DN - 1) - 0.5) * DS;
+  depthData[j * DN + i] = Math.round(Math.min(1, Math.max(0, -heightAt(x, z) / 6.6)) * 255);
+}
+const depthTex = new THREE.DataTexture(depthData, DN, DN, THREE.RedFormat);
+depthTex.magFilter = depthTex.minFilter = THREE.LinearFilter;
+depthTex.needsUpdate = true;
+const waterGeo = new THREE.PlaneGeometry(800, 800, HQ ? 400 : 180, HQ ? 400 : 180);
+waterGeo.rotateX(-Math.PI / 2);
+const waterMat = new THREE.MeshStandardMaterial({ color: '#ffffff', transparent: true, roughness: 0.2, metalness: 0.1, flatShading: true });
+// 6 tons: raso turquesa -> abismo
+const SEA = ['#6be3d4', '#3ccbe0', '#26a8dc', '#1b7fc7', '#13559e', '#0b3170'].map(c => new THREE.Color(c));
+const waterUniforms = { uTime: { value: 0 }, uSea: { value: SEA }, uDepth: { value: depthTex } };
+waterMat.onBeforeCompile = (sh) => {
+  sh.uniforms.uTime = waterUniforms.uTime;
+  sh.uniforms.uSea = waterUniforms.uSea;
+  sh.uniforms.uDepth = waterUniforms.uDepth;
+  sh.vertexShader = 'uniform float uTime;\nvarying vec3 vWPos;\nvarying float vH;\n' + sh.vertexShader.replace('#include <begin_vertex>',
+    `#include <begin_vertex>
+     float wv = sin(position.x * 0.15 + uTime) * 0.12 + cos(position.z * 0.2 + uTime * 1.3) * 0.1
+              + sin((position.x + position.z) * 0.5 + uTime * 2.0) * 0.03;
+     transformed.y += wv;
+     vH = wv;
+     vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+  sh.fragmentShader = 'uniform float uTime;\nuniform vec3 uSea[6];\nuniform sampler2D uDepth;\nvarying vec3 vWPos;\nvarying float vH;\n' + sh.fragmentShader.replace('#include <color_fragment>',
+    `#include <color_fragment>
+     vec2 duv = vWPos.xz / 240.0 + 0.5;
+     float inside = step(0.0, duv.x) * step(duv.x, 1.0) * step(0.0, duv.y) * step(duv.y, 1.0);
+     float dep = mix(1.0, texture2D(uDepth, duv).r, inside);
+     dep += (sin(vWPos.x * 0.21 + uTime * 0.3) + cos(vWPos.z * 0.17 - uTime * 0.25)) * 0.015;
+     float L = length(vWPos.xz);
+     vec3 c = uSea[0];
+     c = mix(c, uSea[1], smoothstep(0.03, 0.12, dep));
+     c = mix(c, uSea[2], smoothstep(0.12, 0.35, dep));
+     c = mix(c, uSea[3], smoothstep(0.35, 0.8, dep));
+     c = mix(c, uSea[4], smoothstep(90.0, 150.0, L));
+     c = mix(c, uSea[5], smoothstep(150.0, 260.0, L));
+     // cristas claras e espuma na arrebentação
+     c = mix(c, vec3(1.0), smoothstep(0.17, 0.24, vH) * 0.35);
+     float surf = 1.0 - smoothstep(0.0, 0.05, dep - 0.005 - sin(uTime * 1.5) * 0.01);
+     c = mix(c, vec3(1.0), surf * 0.45);
+     diffuseColor.rgb = c;
+     diffuseColor.a = mix(0.55, 1.0, smoothstep(0.05, 0.4, dep));`);
+};
+const water = new THREE.Mesh(waterGeo, waterMat);
+water.receiveShadow = true;
+scene.add(water);
+
+// ---------- palmeiras ----------
+const trunkMat = new THREE.MeshStandardMaterial({ color: '#8b5a2b' });
+const leafMat = new THREE.MeshStandardMaterial({ color: '#2e9e44', flatShading: true, side: THREE.DoubleSide });
+const coconutMat = new THREE.MeshStandardMaterial({ color: '#5a3a1a' });
+const palms = [];
+function makePalm(x, z, s = 1) {
+  const g = new THREE.Group();
+  const lean = (Math.random() - 0.5) * 0.5;
+  let y = 0, px = 0;
+  for (let i = 0; i < 7; i++) {
+    const seg = new THREE.Mesh(new THREE.CylinderGeometry(0.22 - i * 0.015, 0.26 - i * 0.015, 0.75, 14), trunkMat);
+    px += lean * i * 0.08;
+    seg.position.set(px, y + 0.37, 0);
+    seg.rotation.z = -lean * 0.3;
+    seg.castShadow = true;
+    g.add(seg); y += 0.7;
+  }
+  const crown = new THREE.Group(); crown.position.set(px, y, 0); g.add(crown);
+  for (let i = 0; i < 11; i++) {
+    const shape = new THREE.Shape();
+    shape.moveTo(0, 0); shape.quadraticCurveTo(1.4, 0.45, 3, 0); shape.quadraticCurveTo(1.4, -0.45, 0, 0);
+    const leaf = new THREE.Mesh(new THREE.ShapeGeometry(shape, 20), leafMat);
+    leaf.rotation.set(-Math.PI / 2, 0.45 + Math.random() * 0.3, 0);
+    leaf.castShadow = true;
+    const holder = new THREE.Group();
+    holder.rotation.y = (i / 11) * Math.PI * 2 + Math.random() * 0.3;
+    holder.add(leaf); crown.add(holder);
+  }
+  const cocos = [];
+  for (let i = 0; i < 3; i++) {
+    const c = new THREE.Mesh(new THREE.SphereGeometry(0.18, 20, 14), coconutMat);
+    c.position.set(Math.cos(i * 2.1) * 0.25, -0.2, Math.sin(i * 2.1) * 0.25);
+    crown.add(c); cocos.push(c);
+  }
+  g.position.set(x, heightAt(x, z) - 0.1, z);
+  g.scale.setScalar(0.01);
+  g.userData = { target: s, crown, cocos, phase: Math.random() * 10, shake: 0 };
+  g.rotation.y = Math.random() * Math.PI * 2;
+  scene.add(g); palms.push(g);
+  return g;
+}
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+for (let n = 0, tries = 0; n < 45 && tries < 3000; tries++) {
+  const x = (rnd() - 0.5) * 150, z = (rnd() - 0.5) * 150;
+  if (heightAt(x, z) < 0.4 || Math.hypot(x - 5, z - 8) < 4 || palms.some(p => Math.hypot(p.position.x - x, p.position.z - z) < 3)) continue;
+  makePalm(x, z, 0.9 + rnd() * 0.35); n++;
+}
+
+// ---------- pedras ----------
+const rockMat = new THREE.MeshStandardMaterial({ color: '#9a948c', flatShading: true });
+for (let n = 0, tries = 0; n < 50 && tries < 5000; tries++) {
+  const x = (rnd() - 0.5) * 200, z = (rnd() - 0.5) * 200, y = heightAt(x, z);
+  if (y < -0.5 || y > 0.4) continue; // só na linha da costa
+  const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.5 + rnd() * 1.2, 1), rockMat);
+  rock.position.set(x, Math.max(y, -0.3), z);
+  rock.rotation.set(rnd() * 3, rnd() * 3, 0);
+  rock.castShadow = rock.receiveShadow = true;
+  scene.add(rock); n++;
+}
+
+// ---------- cabana ----------
+(function hut() {
+  const g = new THREE.Group();
+  const wood = new THREE.MeshStandardMaterial({ color: '#a0703c', flatShading: true });
+  const straw = new THREE.MeshStandardMaterial({ color: '#d9b45a', flatShading: true });
+  const base = new THREE.Mesh(new THREE.BoxGeometry(3, 1.8, 2.6), wood); base.position.y = 0.9;
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(2.6, 1.8, 4, 6), straw); roof.position.y = 2.7; roof.rotation.y = Math.PI / 4;
+  const door = new THREE.Mesh(new THREE.BoxGeometry(1, 1.2, 0.05), new THREE.MeshStandardMaterial({ color: '#5a3a1a' }));
+  door.position.set(0, 0.6, 1.31);
+  [base, roof].forEach(m => { m.castShadow = m.receiveShadow = true; });
+  g.add(base, roof, door);
+  g.position.set(5, heightAt(5, 8) - 0.2, 8);
+  g.rotation.y = 0.5;
+  scene.add(g);
+})();
+
+// ---------- nuvens ----------
+const clouds = [];
+const cloudMat = new THREE.MeshLambertMaterial({ color: '#ffffff', emissive: '#ffffff', emissiveIntensity: 0.45 });
+for (let i = 0; i < 22; i++) {
+  const c = new THREE.Group();
+  for (let j = 0; j < 4; j++) {
+    const p = new THREE.Mesh(new THREE.IcosahedronGeometry(1.5 + Math.random(), 2), cloudMat);
+    p.position.set(j * 1.6, Math.random() * 0.6, Math.random() * 1.2);
+    c.add(p);
+  }
+  c.position.set((Math.random() - 0.5) * 360, 26 + Math.random() * 12, (Math.random() - 0.5) * 360);
+  scene.add(c); clouds.push(c);
+}
+
+// ---------- personagem ----------
+const hero = new THREE.Group();
+const skin = new THREE.MeshStandardMaterial({ color: '#f1c27d' });
+const shirt = new THREE.MeshStandardMaterial({ color: '#e8553f' });
+const pants = new THREE.MeshStandardMaterial({ color: '#3b5b8c', flatShading: true });
+const hatMat = new THREE.MeshStandardMaterial({ color: '#e9c46a' });
+const body = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.38, 0.8, 24), shirt); body.position.y = 1.05;
+const head = new THREE.Mesh(new THREE.SphereGeometry(0.3, 32, 24), skin); head.position.y = 1.72;
+const brim = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 0.05, 40), hatMat); brim.position.y = 1.92;
+const cap = new THREE.Mesh(new THREE.ConeGeometry(0.32, 0.35, 32), hatMat); cap.position.y = 2.1;
+const eye = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.06, 0.02), new THREE.MeshBasicMaterial({ color: '#222' }));
+eye.position.set(0, 1.76, 0.29);
+function limb(mat, w, h, x, y) {
+  const pivot = new THREE.Group(); pivot.position.set(x, y, 0);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, w), mat); m.position.y = -h / 2; m.castShadow = true;
+  pivot.add(m); hero.add(pivot); return pivot;
+}
+const legL = limb(pants, 0.18, 0.65, -0.14, 0.66), legR = limb(pants, 0.18, 0.65, 0.14, 0.66);
+const armL = limb(shirt, 0.14, 0.6, -0.42, 1.38), armR = limb(shirt, 0.14, 0.6, 0.42, 1.38);
+[body, head, brim, cap].forEach(m => { m.castShadow = true; });
+hero.add(body, head, brim, cap, eye);
+hero.scale.setScalar(1.2);
+hero.position.set(-2, heightAt(-2, 4), 4);
+scene.add(hero);
+
+// modelo do Blender (models/hero.glb); se falhar, fica o boneco procedural
+let mixer = null, clips = {}, curClip = null;
+function play(name) {
+  if (!mixer || curClip === name || !clips[name]) return;
+  const next = clips[name];
+  next.reset().setEffectiveWeight(1).fadeIn(0.18).play();
+  if (curClip) clips[curClip].fadeOut(0.18);
+  curClip = name;
+}
+const HERO = new URLSearchParams(location.search).get('hero') || 'fazendeira';
+new GLTFLoader().load(`models/${HERO}.glb`, (gltf) => {
+  const model = gltf.scene;
+  model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; o.frustumCulled = false; } });
+  hero.children.forEach(c => { c.visible = false; });
+  model.scale.setScalar(1 / 1.2 * 1.15);
+  hero.add(model);
+  mixer = new THREE.AnimationMixer(model);
+  const anims = gltf.animations.some(a => a.name.includes('|')) ? gltf.animations.filter(a => a.name.includes('|')) : gltf.animations;
+  for (const a of anims) clips[a.name.split('|').pop()] = mixer.clipAction(a);
+  if (!clips.Action && clips.Interact) clips.Action = clips.Interact;
+  if (clips.Idle_Neutral) clips.Idle = clips.Idle_Neutral; // Idle original torce o pé
+  if (clips.Walk) clips.Walk.timeScale = HERO === 'hero' ? 1.5 : 1.8;
+  if (clips.Action) { clips.Action.setLoop(THREE.LoopOnce); clips.Action.clampWhenFinished = true; clips.Action.timeScale = 1.3; }
+  play('Idle');
+  window.__ilha.glb = Object.keys(clips);
+}, undefined, (e) => console.warn('hero.glb não carregou, usando boneco padrão', e));
+
+// marcador de destino
+const marker = new THREE.Mesh(new THREE.RingGeometry(0.35, 0.5, 64), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true }));
+marker.rotation.x = -Math.PI / 2; marker.visible = false; scene.add(marker);
+
+const state = { target: null, onArrive: null, action: 0, mode: 'walk', cocos: 0, follow: false };
+const SPEED = 4.5;
+window.__ilha = { state, hero, palms, camera };
+
+function walkTo(x, z, onArrive) {
+  state.target = new THREE.Vector3(x, 0, z);
+  state.onArrive = onArrive || null;
+  marker.position.set(x, heightAt(x, z) + 0.05, z);
+  marker.visible = true;
+}
+
+// ---------- UI ----------
+const $ = (id) => document.getElementById(id);
+let toastT;
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 1400); }
+function setMode(m) { state.mode = m; $('mWalk').classList.toggle('on', m === 'walk'); $('mPlant').classList.toggle('on', m === 'plant'); }
+$('mWalk').onclick = () => setMode('walk');
+$('mPlant').onclick = () => setMode('plant');
+$('mCenter').onclick = () => { state.follow = true; };
+addEventListener('keydown', e => { if (e.key === '1') setMode('walk'); if (e.key === '2') setMode('plant'); if (e.key === 'c' || e.key === 'C') state.follow = true; });
+
+// ---------- clique & ação ----------
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+let downAt = 0, downX = 0, downY = 0;
+renderer.domElement.addEventListener('pointerdown', e => { downAt = performance.now(); downX = e.clientX; downY = e.clientY; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (performance.now() - downAt > 300 || Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return; // arrasto
+  mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+
+  // 1) clicou numa palmeira -> ir até ela e colher
+  const ph = ray.intersectObjects(palms, true)[0];
+  if (ph) {
+    let p = ph.object; while (!palms.includes(p)) p = p.parent;
+    const dir = new THREE.Vector3().subVectors(hero.position, p.position).setY(0).normalize().multiplyScalar(1.1);
+    walkTo(p.position.x + dir.x, p.position.z + dir.z, () => harvest(p));
+    return;
+  }
+  // 2) clicou no chão
+  const hit = ray.intersectObject(island)[0];
+  if (!hit) return;
+  if (hit.point.y < 0.05) { toast('🌊 Água! Não dá pra ir aí'); return; }
+  const { x, z } = hit.point;
+  if (state.mode === 'plant') {
+    if (palms.some(p => Math.hypot(p.position.x - x, p.position.z - z) < 1.8)) { toast('Perto demais de outra palmeira'); return; }
+    if (state.cocos < 1) { toast('Precisa de 🥥 para plantar'); return; }
+    walkTo(x, z + 0.9, () => {
+      state.cocos--; $('coco').textContent = state.cocos;
+      state.action = 0.8;
+      makePalm(x, z, 0.9 + Math.random() * 0.3);
+      toast('🌱 Plantou!');
+    });
+  } else walkTo(x, z);
+});
+
+function harvest(p) {
+  hero.lookAt(p.position.x, hero.position.y, p.position.z);
+  state.action = 0.8;
+  p.userData.shake = 1;
+  const c = p.userData.cocos.find(c => c.visible);
+  if (!c || p.scale.x < p.userData.target * 0.95) { toast('Sem coco maduro aqui'); return; }
+  c.visible = false;
+  state.cocos++; $('coco').textContent = state.cocos;
+  toast('🥥 +1');
+  setTimeout(() => { c.visible = true; }, 20000); // coco volta em 20s
+}
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+let walkPhase = 0;
+function animate() {
+  const dt = Math.min(clock.getDelta(), 0.1), t = clock.elapsedTime;
+  waterUniforms.uTime.value = t;
+
+  // movimento do personagem
+  let moving = false;
+  if (state.target) {
+    const dx = state.target.x - hero.position.x, dz = state.target.z - hero.position.z, d = Math.hypot(dx, dz);
+    if (d < 0.08) {
+      state.target = null; marker.visible = false;
+      const cb = state.onArrive; state.onArrive = null; cb && cb();
+    } else {
+      const step = Math.min(d, SPEED * dt);
+      const nx = hero.position.x + dx / d * step, nz = hero.position.z + dz / d * step;
+      if (heightAt(nx, nz) < 0.0) { state.target = null; marker.visible = false; toast('🌊 Água à frente'); }
+      else {
+        hero.position.x = nx; hero.position.z = nz; moving = true;
+        const want = Math.atan2(dx, dz);
+        let diff = want - hero.rotation.y; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        hero.rotation.y += diff * Math.min(1, dt * 12);
+      }
+    }
+  }
+  hero.position.y = heightAt(hero.position.x, hero.position.z);
+
+  // animação: andar / ação / parado
+  if (mixer) {
+    if (state.action > 0) { if (curClip !== 'Action') { clips.Action && clips.Action.reset(); } play('Action'); state.action -= dt; }
+    else play(moving ? 'Walk' : 'Idle');
+    mixer.update(dt);
+  }
+  if (moving) walkPhase += dt * 10;
+  const sw = moving ? Math.sin(walkPhase) * 0.7 : 0;
+  legL.rotation.x = sw; legR.rotation.x = -sw;
+  armL.rotation.x = -sw * 0.8;
+  if (!mixer && state.action > 0) { state.action -= dt; armR.rotation.x = -2.6 + Math.sin(state.action * 20) * 0.4; }
+  else armR.rotation.x = sw * 0.8;
+  body.position.y = 1.05 + (moving ? Math.abs(Math.sin(walkPhase)) * 0.05 : Math.sin(t * 2) * 0.015);
+  marker.material.opacity = 0.5 + Math.sin(t * 6) * 0.3;
+
+  // câmera acompanha o personagem (só horizontal)
+  const prev = controls.target.clone();
+  if (state.follow) {
+    controls.target.lerp(new THREE.Vector3(hero.position.x, 0, hero.position.z), Math.min(1, dt * 4));
+    if (!moving && controls.target.distanceTo(new THREE.Vector3(hero.position.x, 0, hero.position.z)) < 0.05) state.follow = false;
+  }
+  // mantém o mapa no plano e dentro dos limites
+  controls.target.y = 0;
+  const tl = Math.hypot(controls.target.x, controls.target.z);
+  if (tl > 120) { controls.target.x *= 120 / tl; controls.target.z *= 120 / tl; }
+  camera.position.add(controls.target.clone().sub(prev));
+
+  for (const p of palms) {
+    const s = p.scale.x, tg = p.userData.target;
+    if (s < tg) p.scale.setScalar(Math.min(tg, s + (tg - s) * 0.05 + 0.002));
+    if (p.userData.shake > 0) p.userData.shake -= dt * 1.5;
+    p.userData.crown.rotation.z = Math.sin(t * 1.2 + p.userData.phase) * 0.06 + Math.sin(t * 30) * 0.15 * Math.max(0, p.userData.shake);
+  }
+  for (const c of clouds) { c.position.x += 0.02; if (c.position.x > 180) c.position.x = -180; }
+
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
